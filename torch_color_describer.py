@@ -6,10 +6,7 @@ import torch.utils.data
 from torch_model_base import TorchModelBase
 import utils
 from utils import START_SYMBOL, END_SYMBOL, UNK_SYMBOL
-
-__author__ = "Christopher Potts"
-__version__ = "CS224u, Stanford, Spring 2020"
-
+import time
 
 class ColorDataset(torch.utils.data.Dataset):
     """PyTorch dataset for contextual color describers. The primary
@@ -97,7 +94,7 @@ class Encoder(nn.Module):
         super(Encoder, self).__init__()
         self.color_dim = color_dim
         self.hidden_dim = hidden_dim
-        self.rnn = nn.GRU(
+        self.rnn = nn.LSTM(
             input_size=self.color_dim,
             hidden_size=self.hidden_dim,
             batch_first=True)
@@ -127,7 +124,7 @@ class Decoder(nn.Module):
         self.embedding = self._define_embedding(embedding, vocab_size, embed_dim)
         self.embed_dim = self.embedding.embedding_dim
         self.hidden_dim = hidden_dim
-        self.rnn = nn.GRU(
+        self.rnn = nn.LSTM(
             input_size=self.embed_dim,
             hidden_size=self.hidden_dim,
             batch_first=True)
@@ -305,6 +302,7 @@ class ContextualColorDescriber(TorchModelBase):
         # so we remove it to avoid misleading people:
         delattr(self, 'hidden_activation')
         self.params.remove('hidden_activation')
+        self.cur_epoch = 0
 
     def fit(self, color_seqs, word_seqs):
         """Standard `fit` method where `color_seqs` are the inputs and
@@ -353,8 +351,9 @@ class ContextualColorDescriber(TorchModelBase):
 
         loss = nn.CrossEntropyLoss()
 
-        for iteration in range(1, self.max_iter+1):
+        for iteration in range(self.cur_epoch + 1, self.cur_epoch + self.max_iter+1):
             epoch_error = 0.0
+            start = time.time()
             for batch_colors, batch_words, batch_lens, targets in dataloader:
 
                 batch_colors = batch_colors.to(self.device)
@@ -374,8 +373,8 @@ class ContextualColorDescriber(TorchModelBase):
                 err.backward()
                 self.opt.step()
 
-            utils.progress_bar("Epoch {}; err = {}".format(iteration, epoch_error))
-
+            print("Epoch {}; train err = {}; time = {}".format(self.cur_epoch, epoch_error, time.time() - start))
+            self.cur_epoch = self.cur_epoch + 1
         return self
 
     def build_dataset(self, color_seqs, word_seqs):
@@ -495,9 +494,10 @@ class ContextualColorDescriber(TorchModelBase):
             # Adjust decoder_input to be the size of k per example
             decoder_input = top_k_indices.view(len(color_seqs) * k_samples, 1).to(self.device)
             preds = torch.cat([preds, decoder_input], axis=1)
-
+            
             # Extend the hidden representation k times per example
-            hidden = torch.repeat_interleave(hidden, k_samples, dim=1)
+            hidden = (torch.repeat_interleave(hidden[0], k_samples, dim=1), \
+                      torch.repeat_interleave(hidden[1], k_samples, dim=1))
             
             # Extend color_seqs to be k times per example
             extended_color_seqs = torch.repeat_interleave(color_seqs, k_samples, dim=0)
@@ -505,7 +505,6 @@ class ContextualColorDescriber(TorchModelBase):
             # Now move through the remaiming timesteps using the
             # previous timestep to predict the next one:
             for i in range(1, max_length):
-
                 output, hidden, _ = self.model(
                     color_seqs=extended_color_seqs,
                     word_seqs=decoder_input,
@@ -578,14 +577,224 @@ class ContextualColorDescriber(TorchModelBase):
         preds = preds.view(len(color_seqs), k_samples, -1) 
         #print("result:",preds.shape)
         preds = [[self._convert_predictions(ind) for ind in seq]for seq in preds]
-        return preds
+        return preds, torch.exp(accum_top_k_probs)
+    
+    def sample_utterances_with_listener(self, listener, color_seqs, k_samples=6, m_samples=3, max_length=20, batch_size=128, speaker_preference=0.5):
+        """Calculates the top k likely utterances of the decoder using beam search.
+        Parameters
+        ----------
+        color_seqs : list of lists of lists of floats, or np.array
+            Dimension (m, n, p) where m is the number of examples, n is
+            the number of colors in each context, and p is the length
+            of the color representations.
+        k_samples: int
+            Number of samples to return
+        Returns
+        -------
+        list of list of lists of str, where the innder-most list is sorted ascending 
+        in terms of likelihood. That is, for every color sequence in color_seqs, for
+        every sample, there is a list of word sequences.
+        """
+        def copy_top_branches(preds_so_far, top_k_indices, sample_size):
+            # Reconstruct the old predictions so we can choose which branches to keep
+            preds_so_far = preds_so_far.view(sample_size, m_samples, -1)
+            # For each example, for each index in the top k indices, we find the branch 
+            # that maps to the index. 
+            top_indices_unflattened = (top_k_indices // self.vocab_size)
+            # Duplicate the branch per word in the sequence.
+            old_seq_indices = top_indices_unflattened.view(sample_size, k_samples, 1).repeat(1,1,preds_so_far.shape[2])
+            #print("old_seq_indices", old_seq_indices[:5])
+            
+            # We use old_seq_indices to index into preds_so_far, generating our
+            # new branches. For each example, for each branch, we have a sequence
+            # of indices.
+            #print(preds_so_far.shape, old_seq_indices.shape)
+            preds_so_far = torch.gather(preds_so_far, 1, old_seq_indices)
+            #print("preds_so_far",preds_so_far[:5])
+            return preds_so_far
+        
+        def score_with_listener(top_k_probs, top_k_indices, extended_last_col_list, preds_so_far, sample_size):
+            '''
+                Uses the listener to rank the top m words
+                Returns the probabilities and indices of the top words
+            '''
+            # First, we find the branches for the top k samples
+            preds_so_far = copy_top_branches(preds_so_far, top_k_indices, sample_size)
+            
+            # Then, we find the index of the top k words and cat them with the branches
+            index_topk_tokens = (top_k_indices % self.vocab_size).view(sample_size, k_samples, 1)
+            preds = torch.cat([preds_so_far, index_topk_tokens], axis=2)
+                        
+            # Next, let's reshape the predictions and convert them back to a tokenized sequence
+            preds = preds.view(sample_size * k_samples, -1) 
+            preds = [self._convert_predictions(p) for p in preds]
+            
+            # Score the top k
+            #if speaker_preference == 1:
+            #    top_k_scored = (top_k_probs.view(sample_size, k_samples))
+            #elif speaker_preference == 0:
+            #    k_listener_scores = torch.FloatTensor(listener.predict(extended_last_col_list, preds)).to(self.device)
+            #    top_k_scored = torch.log(k_listener_scores).view(sample_size, k_samples)
+            #else:
+            k_listener_scores = torch.FloatTensor(listener.predict(extended_last_col_list, preds)).to(self.device)
+            top_k_scored = speaker_preference*(top_k_probs.view(sample_size, k_samples)) + \
+                           (1-speaker_preference)*torch.log(k_listener_scores).view(sample_size, k_samples)
+
+            top_k_scored = top_k_scored.view(sample_size, k_samples, -1) 
+            
+            # Score the top m 
+            top_m_probs_in_top_k, top_m_indices_in_top_k = top_k_scored.topk(m_samples, dim=1)
+            # Return the values of these top m
+            top_m_probs = torch.gather(top_k_probs.view(sample_size, k_samples, 1), 1, top_m_indices_in_top_k)
+            top_m_indices = torch.gather(top_k_indices.view(sample_size, k_samples, 1), 1, top_m_indices_in_top_k)
+            
+            return top_m_probs, top_m_indices
+        
+        color_seqs = torch.FloatTensor(color_seqs).to(self.device)
+        self.model.to(self.device)
+        self.model.eval()
+        final_preds = []
+        final_scores = []
+        
+        color_seqs_full = [color_seqs[i:i + batch_size] for i in range(0, len(color_seqs), batch_size)]
+        for batch_num, color_seqs in enumerate(color_seqs_full):
+            print("Processing batch",batch_num+1,"/",len(color_seqs_full))
+            with torch.no_grad():
+                preds = []
+                # Get the hidden representations from the color contexts:
+                hidden = self.model.encoder(color_seqs)
+
+                # Start with START_SYMBOL for all examples:
+                decoder_input = [[self.start_index]]  * len(color_seqs)
+                decoder_input = torch.LongTensor(decoder_input).to(self.device)
+                preds = torch.LongTensor([[self.start_index]]  * (len(color_seqs) * m_samples)).to(self.device)
+
+                # Get the prediction for the top k tokens per example
+                output, hidden, _ = self.model(
+                    color_seqs=color_seqs,
+                    word_seqs=decoder_input,
+                    seq_lengths=None,
+                    hidden=hidden)
+                output = torch.log(torch.softmax(output, dim=2))
+
+                # Extend color_seqs to be k times per example
+                extended_m_color_seqs = torch.repeat_interleave(color_seqs, m_samples, dim=0)
+                extended_k_last_col_list = torch.repeat_interleave(color_seqs, k_samples, dim=0)[:, -1].tolist()
+
+                # Find the top k and top m probs
+                top_k_probs, top_k_indices = output.topk(k_samples, dim=2)
+                top_m_probs, top_m_indices = \
+                    score_with_listener(top_k_probs, top_k_indices, extended_k_last_col_list, preds, len(color_seqs))
+
+                # Adjust decoder_input to be the size of k per example
+                decoder_input = top_m_indices.view(len(color_seqs) * m_samples, 1).to(self.device)
+                preds = torch.cat([preds, decoder_input], axis=1)
+
+                accum_top_m_probs = top_m_probs.view(len(color_seqs) * m_samples)
+
+                # Create a set of "ending masks" to mark which ones have completed the sequence
+                end_masks = torch.ones(len(color_seqs) * m_samples).to(self.device)
+
+                # Extend the hidden representation k times per example
+                hidden = (torch.repeat_interleave(hidden[0], m_samples, dim=1), \
+                          torch.repeat_interleave(hidden[1], m_samples, dim=1))
+
+                # Now move through the remaiming timesteps using the
+                # previous timestep to predict the next one:
+                for i in range(1, max_length):
+                    output, hidden, _ = self.model(
+                        color_seqs=extended_m_color_seqs,
+                        word_seqs=decoder_input,
+                        seq_lengths=None,
+                        hidden=hidden)
+                    # Convert to probabilities
+                    output = torch.log(torch.softmax(output, dim=2))
+                    # Mask output shape
+                    output = output * end_masks.view(-1,1,1)
+                    # Reshape back into samples and branches
+                    output = output.view(len(color_seqs), -1, output.shape[2])
+
+                    # Create a second mask to zero out sequence possibilities that are finished
+                    seq_mask = (output == 0).float() * 1 * float(-900000)
+                    seq_mask[:,:,0] = 0
+                    #seq_mask = seq_mask + 1
+                    #print(seq_mask.shape)
+                    #print(seq_mask[:5])
+
+                    # Add the prob of the vocab with the prob of the old branches
+                    top_m_probs_per_token = accum_top_m_probs.view(len(color_seqs), -1 ,1)+seq_mask + output
+                    # Flatten the output so that we can run top m per example
+                    output_accum_flatten = top_m_probs_per_token.view(len(color_seqs), -1)
+                    # Find the top best predictions per example
+                    top_k_probs, top_k_indices = output_accum_flatten.topk(k_samples, dim=1)
+
+                    # Convert the k predictions into m predictions
+                    top_m_probs, top_m_indices = \
+                        score_with_listener(top_k_probs, top_k_indices, extended_k_last_col_list, preds, len(color_seqs))
+
+                    ####
+                    # First, we need to reconstruct the branches that have the highest probability.
+                    ####
+
+                    # Reconstruct the old predictions so we can choose which branches to keep
+                    preds_so_far = preds.view(len(color_seqs), m_samples, -1)
+                    # For each example, for each index in the top_k indices, we find the branch 
+                    # that maps to the index. 
+                    top_m_indices_unflattened = (top_m_indices // output.shape[2])
+                    # Duplicate the branch per word in the sequence.
+                    old_seq_indices = top_m_indices_unflattened.view(len(color_seqs), m_samples, 1).repeat(1,1,preds_so_far.shape[2])
+
+                    # We use old_seq_indices to index into preds_so_far, generating our
+                    # new branches. For each example, for each branch, we have a sequence
+                    # of indices.
+                    preds_so_far = torch.gather(preds_so_far, 1, old_seq_indices)
+
+                    # We also use the same indicies to shuffle our masks
+                    end_masks = \
+                        torch.gather(end_masks.view(len(color_seqs), -1), 1, top_m_indices_unflattened.view(len(color_seqs), -1)).view(-1)
+
+                    ####
+                    # Now we need to find the best predictions that match with the branches that
+                    # were used.
+                    ####
+                    # First, we find the index of the top k words per branch
+                    index_topm_tokens = (top_m_indices % self.vocab_size).view(len(color_seqs), m_samples, 1)
+
+                    # New we append to the existing sequence
+                    preds = torch.cat([preds_so_far, index_topm_tokens], axis=2)
+                    # Now we need to select the accumulated probabilities to the ones we want
+                    accum_top_m_probs = torch.gather(top_m_probs_per_token.view(len(color_seqs), -1), \
+                                                     1, \
+                                                     top_m_indices.view(len(color_seqs), m_samples) \
+                                                    ).view(-1)
+
+                    #Update the mask
+                    end_masks = torch.clamp(end_masks * index_topm_tokens.view(-1), 0, 1)
+                    #print("end_masks", end_masks.view(len(color_seqs), -1)[:5])
+
+                    # Finally, we update the new decoder input for the next timestep
+                    decoder_input = index_topm_tokens.view(-1, 1)
+                    #print("accum_prob",accum_top_m_probs.view(len(color_seqs), -1)[:5])
+
+                    #print("preds",preds[:5])
+            # Convert all the predictions from indices to elements of `self.vocab`:
+            preds = preds.view(len(color_seqs), m_samples, -1) 
+            scores = torch.exp(accum_top_m_probs).view(len(color_seqs), m_samples, -1)
+            # print("result:",preds.shape)
+            final_preds += [[self._convert_predictions(ind) for ind in seq]for seq in preds]
+            final_scores.append(scores)
+        # Convert all the predictions from indices to elements of `self.vocab`:
+        #preds = preds.view(len(color_seqs), m_samples, -1) 
+        # print("result:",preds.shape)
+        #preds = [[self._convert_predictions(ind) for ind in seq]for seq in preds]
+        return final_preds, torch.cat(final_scores, axis=0)
 
     def _convert_predictions(self, pred):
         rep = []
         for i in pred:
             i = i.item()
             rep.append(self.index2word[i])
-            if i == self.end_index:
+            if i == self.end_index or i == 0:
                 return rep
         return rep
 
@@ -771,7 +980,7 @@ class ColorContextDecoder(Decoder):
         
         # Fix the `self.rnn` attribute:
         ##### YOUR CODE HERE
-        self.rnn = nn.GRU(
+        self.rnn = nn.LSTM(
             input_size=self.embed_dim + self.color_dim,
             hidden_size=self.hidden_dim,
             batch_first=True)
@@ -828,7 +1037,11 @@ class ColorizedEncoderDecoder(EncoderDecoder):
         # feed them to the decoder, which already has a
         # `target_colors` keyword.        
         ##### YOUR CODE HERE
-        target_colors = torch.stack([item[-1] for item in color_seqs])
+        if color_seqs.type() in ('torch.FloatTensor', 'torch.cuda.FloatTensor'):
+            target_colors = color_seqs[:, -1]
+        else:
+            # Assume that we are passed in a list otherwise
+            target_colors = torch.stack([item[-1] for item in color_seqs])
         output, hidden = self.decoder(
             word_seqs, seq_lengths=seq_lengths, hidden=hidden, target_colors=target_colors)
         
@@ -862,7 +1075,73 @@ class ColorizedInputDescriber(ContextualColorDescriber):
         
         ##### YOUR CODE HERE
         return ColorizedEncoderDecoder(encoder, decoder)
-            
+    
+    def generate_listener_augmentations(self, \
+                                         input_colors, \
+                                         listener, \
+                                         num_hallucinations=1, \
+                                         alpha=0, \
+                                         m_samples=3, \
+                                         k_samples=6,\
+                                         speaker_preference=0.5,\
+                                         max_length=20,\
+                                         batch_size=1000):
+        '''This method generates listener hallucinations.
+        Parameters
+        ----------
+        input_colors:
+            A list of size (n,m,p) of int where each example has a list of m colors. Each color
+            is embedded in size p.
+        Returns
+        -------
+        prag_speaker_pred:
+            (n,k_samples,*) The top sentences from the speaker that maximizes the likelihood 
+            that the listener will choose the target color. Each sentence can be of different
+            length and is tokenized.
+        '''
+        assert(num_hallucinations <= m_samples)
+        print("Sampling utterances")
+        #utterances, speaker_probs = self.sample_utterances(input_colors, k_samples=k_samples)
+        utterances, speaker_probs = \
+            self.sample_utterances_with_listener(listener, \
+                                                    input_colors, \
+                                                    k_samples=k_samples, \
+                                                    m_samples=m_samples, \
+                                                    max_length=max_length, \
+                                                    batch_size=batch_size, \
+                                                    speaker_preference=speaker_preference) 
+            #speaker.sample_utterances_with_listener(listener, input_colors, k_samples=k_samples, m_samples=num_hallucinations)
+
+        print("Preparing Data")
+        # Prepare data, flatten the target utterances and repeat the input colors per k_sample
+        target_utterances = [seq for seq_list in utterances for seq in seq_list]
+        input_colors_extended = [item for item in input_colors for i in range(m_samples)]
+
+        print("Calculating probabilities")
+        utterance_probs = listener.predict(input_colors_extended, target_utterances, probabilities=True)
+        utterance_probs = torch.FloatTensor([preds[2] for preds in utterance_probs]).view(-1, m_samples).to(self.device)
+        #utterance_probs = utterance_probs ** alpha
+
+        #total = torch.sum(utterance_probs, dim=1).unsqueeze(1)
+        #normalized_utterance_probs = utterance_probs/total
+        normalized_utterance_probs = alpha*torch.log(speaker_probs.view(-1, m_samples)+1e-12) + \
+                                     (1.-alpha)*torch.log(utterance_probs+1e-12)
+        #normalized_utterance_probs = torch.FloatTensor(utterance_probs).view(-1, m_samples).to(speaker.device)
+
+        print("Finding top m utterances")
+        # Find the best k number of utterances that maximize the listener likelihood
+        best_utter_values, best_utter_indices = torch.topk(normalized_utterance_probs, num_hallucinations, dim=1)
+
+        prag_speaker_pred = [[seqs[utter_index] for utter_index in \
+                              best_utter_indices[ind]] for ind, seqs in enumerate(utterances)]
+        return prag_speaker_pred
+    
+    def calc_performance(self, listener_eval, colors):
+        speaker_preds_test = self.predict(colors)
+        listened_preds = listener_eval.predict(colors, speaker_preds_test)
+        correct = sum([1 if x == 2 else 0 for x in listened_preds])
+        print("test", correct, "/", len(listened_preds), correct/len(listened_preds))
+
 def create_example_dataset(group_size=100, vec_dim=2):
     """Creates simple datasets in which the inputs are three-vector
     sequences and the outputs are simple character sequences, with
@@ -923,7 +1202,7 @@ def simple_example(group_size=100, vec_dim=2, initial_embedding=False):
     mod = ColorizedInputDescriber(
         vocab,
         embed_dim=10,
-        hidden_dim=10,
+        hidden_dim=101,
         max_iter=100,
         embedding=embedding)
 
