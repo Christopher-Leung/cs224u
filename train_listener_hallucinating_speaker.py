@@ -53,45 +53,47 @@ def load_glove_from_pickle():
         dev_glove_embedding = pickle.load(handle)
     return dev_glove_vocab, dev_glove_embedding
 
+## Load dataset
+
+dev_vocab, dev_vocab_speaker, dev_vocab_listener, dev_seqs_test, dev_seqs_train, dev_seqs_train_speaker,     dev_seqs_train_listener, dev_cols_test, dev_cols_train, dev_cols_train_speaker, dev_cols_train_listener,     dev_examples_test, embedding = load_from_pickle()
+dev_glove_vocab, dev_glove_embedding = load_glove_from_pickle()
+
+# Load listener models
+literal_listener_listener = ColorizedNeuralListener(
+dev_vocab_listener, 
+#embedding=dev_glove_embedding, 
+embed_dim=100,
+embedding=embedding,
+hidden_dim=100, 
+max_iter=100,
+batch_size=256,
+dropout_prob=0.,
+eta=0.001,
+lr_rate=0.96,
+warm_start=True,
+device='cuda')
+literal_listener_listener.load_model("literal_listener_with_attention_listener_split.pt")
+
+literal_listener_speaker = ColorizedNeuralListener(
+dev_vocab_speaker, 
+#embedding=dev_glove_embedding, 
+embed_dim=100,
+embedding=embedding,
+hidden_dim=100, 
+max_iter=100,
+batch_size=256,
+dropout_prob=0.,
+eta=0.001,
+lr_rate=0.96,
+warm_start=True,
+device='cuda')
+literal_listener_speaker.load_model("literal_listener_with_attention_speaker_split.pt")
+
 def train_and_save(alpha=0, speaker_preference=0.5):
     print("Training with alpha:",alpha,"speaker_preference:",speaker_preference)
     alpha = float(alpha)
     speaker_preference = float(speaker_preference)
-    
-    dev_vocab, dev_vocab_speaker, dev_vocab_listener, dev_seqs_test, dev_seqs_train, dev_seqs_train_speaker,     dev_seqs_train_listener, dev_cols_test, dev_cols_train, dev_cols_train_speaker, dev_cols_train_listener,     dev_examples_test, embedding = load_from_pickle()
-    dev_glove_vocab, dev_glove_embedding = load_glove_from_pickle()
-    
-    # Load listener models
-    literal_listener_listener = ColorizedNeuralListener(
-    dev_vocab_listener, 
-    #embedding=dev_glove_embedding, 
-    embed_dim=100,
-    embedding=embedding,
-    hidden_dim=100, 
-    max_iter=100,
-    batch_size=256,
-    dropout_prob=0.,
-    eta=0.001,
-    lr_rate=0.96,
-    warm_start=True,
-    device='cuda')
-    literal_listener_listener.load_model("literal_listener_with_attention_listener_split.pt")
-    
-    literal_listener_speaker = ColorizedNeuralListener(
-    dev_vocab_speaker, 
-    #embedding=dev_glove_embedding, 
-    embed_dim=100,
-    embedding=embedding,
-    hidden_dim=100, 
-    max_iter=100,
-    batch_size=256,
-    dropout_prob=0.,
-    eta=0.001,
-    lr_rate=0.96,
-    warm_start=True,
-    device='cuda')
-    literal_listener_speaker.load_model("literal_listener_with_attention_speaker_split.pt")
-    
+        
     literal_speaker = ColorizedInputDescriber(
     dev_glove_vocab, 
     embedding=dev_glove_embedding, 
@@ -146,4 +148,4 @@ if __name__ == '__main__':
     for alpha in [0.,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95,1.]:
         for beta in [0.,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95,1.]:
             train_and_save(alpha, beta)
-
+            torch.cuda.empty_cache()
